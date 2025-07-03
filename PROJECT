@@ -8,4 +8,13 @@ layout:
 - go.kubebuilder.io/v4
 projectName: custom-self-adapter-operator
 repo: github.com/custom-self-adapter/custom-self-adapter-operator
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: custom-self-adapter.net
+  kind: CustomSelfAdapter
+  path: github.com/custom-self-adapter/custom-self-adapter-operator/api/v1
+  version: v1
 version: "3"

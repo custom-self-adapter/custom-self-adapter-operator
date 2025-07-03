@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- v1_customselfadapter.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
