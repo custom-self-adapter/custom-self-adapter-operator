@@ -6,6 +6,8 @@ cliVersion: 4.6.0
 domain: custom-self-adapter.net
 layout:
 - go.kubebuilder.io/v4
+plugins:
+  helm.kubebuilder.io/v1-alpha: {}
 projectName: custom-self-adapter-operator
 repo: github.com/custom-self-adapter/custom-self-adapter-operator
 resources:
