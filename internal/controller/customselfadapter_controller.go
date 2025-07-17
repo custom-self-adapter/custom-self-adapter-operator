@@ -107,6 +107,7 @@ type CustomSelfAdapterReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=replicasets;replicasets/scale,verbs=*
 // +kubebuilder:rbac:groups=apps,resources=statefulsets;statefulsets/scale,verbs=*
 // +kubebuilder:rbac:groups=apps,resources=deployments;deployments/scale,verbs=*
+// +kubebuilder:rbac:groups=metrics.k8s.io;custom.metrics.k8s.io;external.metrics.k8s.io,resources=*,verbs=*
 
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.21.0/pkg/reconcile
@@ -190,7 +191,7 @@ func (r *CustomSelfAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			{
 				APIGroups: []string{""},
 				Resources: []string{"pods", "replicationcontrollers", "replicationcontrollers/scale"},
-				Verbs:     []string{"*"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
 			},
 			{
 				APIGroups: []string{"apps"},
