@@ -273,13 +273,20 @@ func (r *CustomSelfAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	// Inject environment variables to every Container specified by the PodSpec
 	containers := []corev1.Container{}
 	for _, container := range podSpec.Containers {
-		// If no environment variables specified by the template PodSpec, set up empty env vars
-		// slice
-		var envVars []corev1.EnvVar
-		if container.Env == nil {
-			envVars = []corev1.EnvVar{}
-		} else {
-			envVars = container.Env
+		// If no environment variables specified by the template PodSpec, set up basic env vars slice
+		// Inject instance name and namespace to Env
+		envVars := []corev1.EnvVar{
+			corev1.EnvVar{
+				Name:  "CSA_NAMESPACE",
+				Value: instance.Namespace,
+			},
+			corev1.EnvVar{
+				Name:  "CSA_NAME",
+				Value: instance.Name,
+			},
+		}
+		if container.Env != nil {
+			envVars = append(envVars, container.Env...)
 		}
 		// Inject in configuration, such as namespace, target ref and configuration
 		// options as environment variables
