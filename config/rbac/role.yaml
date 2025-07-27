@@ -10,11 +10,6 @@ rules:
   - pods
   - replicationcontrollers
   - replicationcontrollers/scale
-  verbs:
-  - '*'
-- apiGroups:
-  - ""
-  resources:
   - serviceaccounts
   verbs:
   - create
@@ -34,7 +29,13 @@ rules:
   - statefulsets
   - statefulsets/scale
   verbs:
-  - '*'
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
 - apiGroups:
   - custom-self-adapter.net
   resources:

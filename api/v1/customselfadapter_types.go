@@ -45,6 +45,7 @@ type CustomSelfAdapterSpec struct {
 
 // CustomSelfAdapterStatus defines the observed state of CustomSelfAdapter.
 type CustomSelfAdapterStatus struct {
+	InitialData string `json:"initialData,omitempty"`
 }
 
 // +kubebuilder:object:root=true

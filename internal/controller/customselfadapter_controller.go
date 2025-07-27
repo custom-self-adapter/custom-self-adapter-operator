@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -102,11 +103,11 @@ type CustomSelfAdapterReconciler struct {
 // +kubebuilder:rbac:groups=custom-self-adapter.net,resources=customselfadapters/finalizers,verbs=update
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=pods,verbs=*
-// +kubebuilder:rbac:groups="",resources=replicationcontrollers;replicationcontrollers/scale,verbs=*
-// +kubebuilder:rbac:groups=apps,resources=replicasets;replicasets/scale,verbs=*
-// +kubebuilder:rbac:groups=apps,resources=statefulsets;statefulsets/scale,verbs=*
-// +kubebuilder:rbac:groups=apps,resources=deployments;deployments/scale,verbs=*
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=replicationcontrollers;replicationcontrollers/scale,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=replicasets;replicasets/scale,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=statefulsets;statefulsets/scale,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments;deployments/scale,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=metrics.k8s.io;custom.metrics.k8s.io;external.metrics.k8s.io,resources=*,verbs=*
 
 // For more details, check Reconcile and its Result here:
@@ -125,6 +126,7 @@ func (r *CustomSelfAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		}
 		return reconcile.Result{}, err
 	}
+	reqLogger.Info("Reconcile starting", "Namespace", instance.Namespace, "Name", instance.Name)
 
 	if instance.DeletionTimestamp != nil {
 		reqLogger.Info("Script K8S Adapter marked for deletion, ignoring reconciliation of dependencies ", "Kind", "script-k8s-adapter.xisberto.net/v1alpha1/ScriptAdapter", "Namespace", instance.GetNamespace(), "Name", instance.GetName())
@@ -196,7 +198,7 @@ func (r *CustomSelfAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			{
 				APIGroups: []string{"apps"},
 				Resources: []string{"deployments", "deployments/scale", "replicasets", "replicasets/scale", "statefulsets", "statefulsets/scale"},
-				Verbs:     []string{"*"},
+				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
 			},
 		},
 	}
@@ -205,7 +207,7 @@ func (r *CustomSelfAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		role.Rules = append(role.Rules, rbacv1.PolicyRule{
 			APIGroups: []string{"metrics.k8s.io", "custom.metrics.k8s.io", "external.metrics.k8s.io"},
 			Resources: []string{"*"},
-			Verbs:     []string{"*"},
+			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
 		})
 	}
 
@@ -213,7 +215,7 @@ func (r *CustomSelfAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		role.Rules = append(role.Rules, rbacv1.PolicyRule{
 			APIGroups: []string{"argoproj.io"},
 			Resources: []string{"rollouts", "rollouts/scale"},
-			Verbs:     []string{"*"},
+			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
 		})
 	}
 	result, err = r.KubernetesResourceReconciler.Reconcile(reqLogger, instance, role, *instance.Spec.ProvisionRole, true, "v1/Role")
@@ -267,45 +269,70 @@ func (r *CustomSelfAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		objectMeta.Namespace = instance.Namespace
 	}
 	objectMeta.Labels = podLabels
-
-	// Set up the PodSpec template
-	podSpec := instance.Spec.Template.Spec
-	// Inject environment variables to every Container specified by the PodSpec
-	containers := []corev1.Container{}
-	for _, container := range podSpec.Containers {
-		// If no environment variables specified by the template PodSpec, set up basic env vars slice
-		// Inject instance name and namespace to Env
-		envVars := []corev1.EnvVar{
-			corev1.EnvVar{
-				Name:  "CSA_NAMESPACE",
-				Value: instance.Namespace,
-			},
-			corev1.EnvVar{
-				Name:  "CSA_NAME",
-				Value: instance.Name,
-			},
-		}
-		if container.Env != nil {
-			envVars = append(envVars, container.Env...)
-		}
-		// Inject in configuration, such as namespace, target ref and configuration
-		// options as environment variables
-		envVars = append(envVars, csaEnvVars(instance, string(scaleTargetRef))...)
-		container.Env = envVars
-		containers = append(containers, container)
+	objectMetaNamespacedName := &types.NamespacedName{
+		Namespace: instance.Namespace,
+		Name:      instance.Name,
 	}
-	// Update PodSpec to use the modified containers, and to point to the provisioned service account
-	podSpec.Containers = containers
-	podSpec.ServiceAccountName = serviceAccount.Name
 
-	// Define Pod object with ObjectMeta and modified PodSpec
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta(objectMeta),
-		Spec:       corev1.PodSpec(podSpec),
-	}
-	result, err = r.KubernetesResourceReconciler.Reconcile(reqLogger, instance, pod, *instance.Spec.ProvisionPod, false, "v1/Pod")
-	if err != nil {
-		return result, err
+	pod := &corev1.Pod{}
+	err = r.Client.Get(ctx, *objectMetaNamespacedName, pod)
+	if err != nil && errors.IsNotFound(err) {
+		// Pod does not exists, proceed with creation
+		// Set up the PodSpec template
+		podSpec := instance.Spec.Template.Spec
+		// Inject environment variables to every Container specified by the PodSpec
+		containers := []corev1.Container{}
+		for _, container := range podSpec.Containers {
+			// If no environment variables specified by the template PodSpec, set up basic env vars slice
+			// Inject instance name and namespace to Env
+			envVars := []corev1.EnvVar{
+				corev1.EnvVar{
+					Name:  "CSA_NAMESPACE",
+					Value: instance.Namespace,
+				},
+				corev1.EnvVar{
+					Name:  "CSA_NAME",
+					Value: instance.Name,
+				},
+			}
+			if container.Env != nil {
+				envVars = append(envVars, container.Env...)
+			}
+			// Inject in configuration, such as namespace, target ref and configuration
+			// options as environment variables
+			envVars = append(envVars, csaEnvVars(instance, string(scaleTargetRef))...)
+			container.Env = envVars
+			containers = append(containers, container)
+		}
+		// Update PodSpec to use the modified containers, and to point to the provisioned service account
+		podSpec.Containers = containers
+		podSpec.ServiceAccountName = serviceAccount.Name
+
+		// Define Pod object with ObjectMeta and modified PodSpec
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta(objectMeta),
+			Spec:       corev1.PodSpec(podSpec),
+		}
+		result, err = r.KubernetesResourceReconciler.Reconcile(reqLogger, instance, pod, *instance.Spec.ProvisionPod, false, "v1/Pod")
+		if err != nil {
+			return result, err
+		}
+		return reconcile.Result{}, err
+	} else {
+		// Pod already exists
+		// Look for specific annotations and update instance status
+		initialDataAnnotation := pod.Annotations["csa.custom-self-adapter.net/initialData"]
+		reqLogger.Info("Pod already exists", "initialData", initialDataAnnotation)
+		patch := client.MergeFrom(instance.DeepCopy())
+		if initialDataAnnotation != "" {
+			instance.Status.InitialData = initialDataAnnotation
+			if err := r.Client.Status().Patch(ctx, instance, patch); err != nil {
+				reqLogger.Error(err, "Error updating instance status")
+				return ctrl.Result{}, err
+			}
+			reqLogger.Info("Updated instance Status")
+			return ctrl.Result{}, nil
+		}
 	}
 
 	// Clean up any orphaned pods (e.g. renaming pod, old pod should be deleted)
@@ -349,7 +376,7 @@ func (r *CustomSelfAdapterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&customselfadapternetv1.CustomSelfAdapter{}).
 		Named("customselfadapter").
 		WithEventFilter(PrimaryPred).
-		Owns(&corev1.Pod{}, builder.WithPredicates(SecondaryPred)).
+		Owns(&corev1.Pod{}).
 		Owns(&corev1.ServiceAccount{}, builder.WithPredicates(SecondaryPred)).
 		Owns(&rbacv1.Role{}, builder.WithPredicates(SecondaryPred)).
 		Owns(&rbacv1.RoleBinding{}, builder.WithPredicates(SecondaryPred)).
