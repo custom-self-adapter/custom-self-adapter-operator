@@ -191,6 +191,11 @@ func (r *CustomSelfAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		},
 		Rules: []rbacv1.PolicyRule{
 			{
+				APIGroups: []string{"custom-self-adapter.net"},
+				Resources: []string{"customselfadapters/status"},
+				Verbs:     []string{"get"},
+			},
+			{
 				APIGroups: []string{""},
 				Resources: []string{"pods", "replicationcontrollers", "replicationcontrollers/scale"},
 				Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
@@ -274,42 +279,44 @@ func (r *CustomSelfAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		Name:      instance.Name,
 	}
 
+	// Set up the PodSpec template
+	podSpec := instance.Spec.Template.Spec
+	// Inject environment variables to every Container specified by the PodSpec
+	containers := []corev1.Container{}
+	for _, container := range podSpec.Containers {
+		// If no environment variables specified by the template PodSpec, set up basic env vars slice
+		// Inject instance name and namespace to Env
+		envVars := []corev1.EnvVar{
+			corev1.EnvVar{
+				Name:  "CSA_NAMESPACE",
+				Value: instance.Namespace,
+			},
+			corev1.EnvVar{
+				Name:  "CSA_NAME",
+				Value: instance.Name,
+			},
+		}
+		if container.Env != nil {
+			envVars = append(envVars, container.Env...)
+		}
+		// Inject in configuration, such as namespace, target ref and configuration
+		// options as environment variables
+		envVars = append(envVars, csaEnvVars(instance, string(scaleTargetRef))...)
+		container.Env = envVars
+		containers = append(containers, container)
+	}
+	// Update PodSpec to use the modified containers, and to point to the provisioned service account
+	podSpec.Containers = containers
+	podSpec.ServiceAccountName = serviceAccount.Name
+
+	// We'll try to get the pod from the cluster. If it doesn't exists, we create it.
+	// If it exists, we reconcile it back to the metadata and spec
 	pod := &corev1.Pod{}
 	err = r.Client.Get(ctx, *objectMetaNamespacedName, pod)
 	if err != nil && errors.IsNotFound(err) {
 		// Pod does not exists, proceed with creation
-		// Set up the PodSpec template
-		podSpec := instance.Spec.Template.Spec
-		// Inject environment variables to every Container specified by the PodSpec
-		containers := []corev1.Container{}
-		for _, container := range podSpec.Containers {
-			// If no environment variables specified by the template PodSpec, set up basic env vars slice
-			// Inject instance name and namespace to Env
-			envVars := []corev1.EnvVar{
-				corev1.EnvVar{
-					Name:  "CSA_NAMESPACE",
-					Value: instance.Namespace,
-				},
-				corev1.EnvVar{
-					Name:  "CSA_NAME",
-					Value: instance.Name,
-				},
-			}
-			if container.Env != nil {
-				envVars = append(envVars, container.Env...)
-			}
-			// Inject in configuration, such as namespace, target ref and configuration
-			// options as environment variables
-			envVars = append(envVars, csaEnvVars(instance, string(scaleTargetRef))...)
-			container.Env = envVars
-			containers = append(containers, container)
-		}
-		// Update PodSpec to use the modified containers, and to point to the provisioned service account
-		podSpec.Containers = containers
-		podSpec.ServiceAccountName = serviceAccount.Name
-
 		// Define Pod object with ObjectMeta and modified PodSpec
-		pod := &corev1.Pod{
+		pod = &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta(objectMeta),
 			Spec:       corev1.PodSpec(podSpec),
 		}
@@ -320,19 +327,26 @@ func (r *CustomSelfAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return reconcile.Result{}, err
 	} else {
 		// Pod already exists
-		// Look for specific annotations and update instance status
+		// Look for our annotations on the pod and update instance status
 		initialDataAnnotation := pod.Annotations["csa.custom-self-adapter.net/initialData"]
 		reqLogger.Info("Pod already exists", "initialData", initialDataAnnotation)
-		patch := client.MergeFrom(instance.DeepCopy())
-		if initialDataAnnotation != "" {
-			instance.Status.InitialData = initialDataAnnotation
-			if err := r.Client.Status().Patch(ctx, instance, patch); err != nil {
-				reqLogger.Error(err, "Error updating instance status")
-				return ctrl.Result{}, err
-			}
-			reqLogger.Info("Updated instance Status")
-			return ctrl.Result{}, nil
+		instance.Status.InitialData = initialDataAnnotation
+		err = r.Client.Status().Update(ctx, instance)
+		if err != nil {
+			reqLogger.Error(err, "Error updating instance status")
+			return ctrl.Result{}, err
 		}
+		reqLogger.Info("Updated instance status")
+
+		// Change pod metadata and spec back to definition
+		pod.ObjectMeta = metav1.ObjectMeta(objectMeta)
+		pod.Spec = corev1.PodSpec(podSpec)
+		reqLogger.Info("Updating pod spec", "image", podSpec.Containers[0].Image)
+		result, err = r.KubernetesResourceReconciler.Reconcile(reqLogger, instance, pod, true, true, "v1/Pod")
+		if err != nil {
+			return result, err
+		}
+		reqLogger.Info("Updated pod")
 	}
 
 	// Clean up any orphaned pods (e.g. renaming pod, old pod should be deleted)
