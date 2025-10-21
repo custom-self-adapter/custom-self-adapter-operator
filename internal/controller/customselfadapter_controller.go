@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -26,7 +27,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -41,8 +41,10 @@ import (
 )
 
 const (
-	managedByLabel = "app.kubernetes.io/managed-by"
-	OwnedByLabel   = "v1.custom-resources-adapter.net/owned-by"
+	managedByLabel   = "app.kubernetes.io/managed-by"
+	ownedByLabel     = "v1.custom-resources-adapter.net/owned-by"
+	managedAnnPrefix = "csa.custom-self-adapter.net"
+	templateHashKey  = "csa.custom-self-adapter.net/template-hash"
 )
 
 type K8sReconciler interface {
@@ -54,40 +56,58 @@ type K8sReconciler interface {
 		updateable bool,
 		kind string,
 	) (reconcile.Result, error)
-	PodCleanup(reqLogger logr.Logger, instance *customselfadapternetv1.CustomSelfAdapter) error
+	ReconcilePod(
+		ctx context.Context,
+		log logr.Logger,
+		owner client.Object,
+		pod *corev1.Pod,
+		managedAnnPrefix string,
+		templateHashKey string,
+		ensureLabels map[string]string,
+	) (ctrl.Result, error)
+	PodCleanup(
+		reqLogger logr.Logger,
+		instance *customselfadapternetv1.CustomSelfAdapter,
+		ownedByLabel string,
+	) error
 }
 
-// PrimaryPred is the predicate that filters events for the ScriptAdapter primary resource.
-var PrimaryPred = predicate.Funcs{
-	UpdateFunc: func(e event.UpdateEvent) bool {
-		return true
-	},
-	DeleteFunc: func(e event.DeleteEvent) bool {
-		return true
-	},
-	CreateFunc: func(e event.CreateEvent) bool {
-		return true
-	},
-	GenericFunc: func(e event.GenericEvent) bool {
-		return false
-	},
+var log = ctrl.Log.WithName("predicates")
+
+func annChangedWithPrefix(old, new map[string]string, prefix string) bool {
+	for k, newV := range new {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		if old == nil {
+			return true
+		}
+		if oldV, ok := old[k]; !ok || oldV != newV {
+			return true
+		}
+	}
+	return false
 }
 
-// SecondaryPred is the predicate that filters events for the ScriptAdapter's secondary
-// resources (deployment/service/role/rolebinding).
+var PrimaryPred = predicate.Or(
+	predicate.GenerationChangedPredicate{},
+	predicate.Funcs{DeleteFunc: func(e event.DeleteEvent) bool { return true }},
+)
+
 var SecondaryPred = predicate.Funcs{
 	UpdateFunc: func(e event.UpdateEvent) bool {
+		if newPod, ok := e.ObjectNew.(*corev1.Pod); ok {
+			oldPod := e.ObjectOld.(*corev1.Pod)
+			if annChangedWithPrefix(oldPod.GetAnnotations(), newPod.GetAnnotations(), managedAnnPrefix) {
+				log.Info("pod managed annotation changed -> reconcile", "pod", newPod.Name)
+				return true
+			}
+			return false
+		}
 		return false
 	},
-	DeleteFunc: func(e event.DeleteEvent) bool {
-		return true
-	},
-	CreateFunc: func(e event.CreateEvent) bool {
-		return false
-	},
-	GenericFunc: func(e event.GenericEvent) bool {
-		return false
-	},
+	DeleteFunc: func(e event.DeleteEvent) bool { return true },
+	CreateFunc: func(e event.CreateEvent) bool { return false },
 }
 
 // CustomSelfAdapterReconciler reconciles a CustomSelfAdapter object
@@ -165,8 +185,8 @@ func (r *CustomSelfAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 
 	labels := map[string]string{
-		managedByLabel: "script-k8s-adapter-operator",
-		OwnedByLabel:   instance.Name,
+		managedByLabel: "custom-self-adapter-operator",
+		ownedByLabel:   instance.Name,
 	}
 
 	// Define and Reconcile a new Service Account object
@@ -261,11 +281,11 @@ func (r *CustomSelfAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	} else {
 		podLabels = instance.Spec.Template.ObjectMeta.Labels
 	}
-	podLabels[managedByLabel] = "script-k8s-adapter-operator"
-	podLabels[OwnedByLabel] = instance.Name
+	podLabels[managedByLabel] = "custom-self-adapter-operator"
+	podLabels[ownedByLabel] = instance.Name
 
 	// Set up ObjectMeta, if no name or namespaces are provided in the template PodSpec then
-	// the SKA name and namespace are used
+	// the CSA name and namespace are used
 	objectMeta := instance.Spec.Template.ObjectMeta
 	if objectMeta.Name == "" {
 		objectMeta.Name = instance.Name
@@ -274,10 +294,6 @@ func (r *CustomSelfAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		objectMeta.Namespace = instance.Namespace
 	}
 	objectMeta.Labels = podLabels
-	objectMetaNamespacedName := &types.NamespacedName{
-		Namespace: instance.Namespace,
-		Name:      instance.Name,
-	}
 
 	// Set up the PodSpec template
 	podSpec := instance.Spec.Template.Spec
@@ -309,52 +325,36 @@ func (r *CustomSelfAdapterReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	podSpec.Containers = containers
 	podSpec.ServiceAccountName = serviceAccount.Name
 
-	// We'll try to get the pod from the cluster. If it doesn't exists, we create it.
-	// If it exists, we reconcile it back to the metadata and spec
-	pod := &corev1.Pod{}
-	err = r.Client.Get(ctx, *objectMetaNamespacedName, pod)
-	if err != nil && errors.IsNotFound(err) {
-		// Pod does not exists, proceed with creation
-		// Define Pod object with ObjectMeta and modified PodSpec
-		pod = &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta(objectMeta),
-			Spec:       corev1.PodSpec(podSpec),
-		}
-		result, err = r.KubernetesResourceReconciler.Reconcile(reqLogger, instance, pod, *instance.Spec.ProvisionPod, false, "v1/Pod")
-		if err != nil {
-			return result, err
-		}
-		return reconcile.Result{}, err
-	} else {
-		// Pod already exists
-		// Look for our annotations on the pod and update instance status
-		initialDataAnnotation := pod.Annotations["csa.custom-self-adapter.net/initialData"]
-		reqLogger.Info("Pod already exists", "initialData", initialDataAnnotation)
-		instance.Status.InitialData = initialDataAnnotation
-		err = r.Client.Status().Update(ctx, instance)
-		if err != nil {
-			reqLogger.Error(err, "Error updating instance status")
-			return ctrl.Result{}, err
-		}
-		reqLogger.Info("Updated instance status")
-
-		// Change pod metadata and spec back to definition
-		pod.ObjectMeta = metav1.ObjectMeta(objectMeta)
-		pod.Spec = corev1.PodSpec(podSpec)
-		reqLogger.Info("Updating pod spec", "image", podSpec.Containers[0].Image)
-		result, err = r.KubernetesResourceReconciler.Reconcile(reqLogger, instance, pod, true, true, "v1/Pod")
-		if err != nil {
-			return result, err
-		}
-		reqLogger.Info("Updated pod")
+	// Build the labels you want to enforce on the Pod
+	ensureLabels := map[string]string{
+		managedByLabel: "custom-self-adapter-operator",
+		ownedByLabel:   instance.Name, // instance is your CR
 	}
 
+	// Define Pod object with ObjectMeta and modified PodSpec
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta(objectMeta),
+		Spec:       corev1.PodSpec(podSpec),
+	}
+	reqLogger.Info("Calling Reconcile for pod", "image", pod.Spec.Containers[0].Image)
+	result, err = r.KubernetesResourceReconciler.ReconcilePod(
+		ctx,
+		reqLogger,
+		instance,
+		pod,
+		managedAnnPrefix,
+		templateHashKey,
+		ensureLabels,
+	)
+
+	reqLogger.Info("Calling PodCleanup")
 	// Clean up any orphaned pods (e.g. renaming pod, old pod should be deleted)
-	err = r.KubernetesResourceReconciler.PodCleanup(reqLogger, instance)
+	err = r.KubernetesResourceReconciler.PodCleanup(reqLogger, instance, ownedByLabel)
 	if err != nil {
 		return result, err
 	}
 
+	reqLogger.Info("Reconcile ending")
 	return result, nil
 }
 
@@ -389,8 +389,7 @@ func (r *CustomSelfAdapterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&customselfadapternetv1.CustomSelfAdapter{}).
 		Named("customselfadapter").
-		WithEventFilter(PrimaryPred).
-		Owns(&corev1.Pod{}).
+		Owns(&corev1.Pod{}, builder.WithPredicates(SecondaryPred)).
 		Owns(&corev1.ServiceAccount{}, builder.WithPredicates(SecondaryPred)).
 		Owns(&rbacv1.Role{}, builder.WithPredicates(SecondaryPred)).
 		Owns(&rbacv1.RoleBinding{}, builder.WithPredicates(SecondaryPred)).
